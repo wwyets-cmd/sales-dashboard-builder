@@ -1,27 +1,33 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-build_dashboard.py — 炬森五金「鲁浙销售数据看板」生成器
-====================================================
-输入两份原始销售发货明细（.xls/.xlsx），输出一个自包含的交互式 HTML 看板。
+build_dashboard.py — 炬森五金「销售数据看板」生成器（全国通用版）
+================================================================
+输入当年/上年销售发货明细，输出自包含交互式 HTML 看板。
 
 用法:
     python3 build_dashboard.py \
         --file26 2026数据文件.xls   # 当年数据: 前4行为筛选条件, 表头在第5行(header=4)
         --file25 2025数据文件.xls   # 上年数据: 表头在第1行(header=0), 包含全年1-12月
-        [--out sales_dashboard.html]      # 输出文件, 默认 sales_dashboard.html
-        [--target 31900000]               # 年度总目标(元), 默认3190万
-        [--template template.html]        # HTML模板, 默认找脚本同目录template.html
+        [--out sales_dashboard.html]      # 输出文件
+        [--targets targets.json]          # 地级市目标配置(万): {"济南市":600,...} 或 {"济南市":{"province":"山东省","target_wan":600}}
+        [--salesman-col 销售员]            # 业务员字段列名(缺省'销售员')
+        [--province-owner '{"山东省":"卢力"}']  # 省份→业务员覆盖映射(JSON); 缺省不用覆盖
+        [--exclude-customers '["客户A"]']      # 剔除客户(JSON数组)
+        [--merge-customers '{"旧名":"新名"}']  # 客户合并(JSON对象)
+        [--keep-min-wan 5]                # 客户排名阈值(万)
+        [--filter-min-wan 50]             # 筛选器客户阈值(万)
+        [--title '炬森五金 · 销售数据看板']   # 看板标题
+        [--target 31900000]               # 年度总目标(元), 缺省=所有城市目标之和
         [--skip-25]                       # 跳过上年数据(不生成同比)
 
-数据口径(固化自业务规则):
-    - 业务归属: 山东省→卢力, 浙江省→刘滔(原始销售员一律按省份覆盖)
-    - 剔除客户: 山东鹏大新型材料科技有限公司, 德州科硕建材有限公司
-    - 客户合并: 青岛博丽特五金有限公司 → 青岛炬鑫五金有限公司
-    - 客户排名: 删除当年销售额<5万的客户; 筛选器只保留当年≥50万的客户
+数据口径:
+    - 业务归属: 默认取数据'销售员'列; 传 --province-owner 时按省份覆盖
+    - 客户排名: 删除当年销售额<keep_min的客户; 筛选器只保留≥filter_min的客户
     - 品类: 铰链/滑轨/反弹器/拉篮/水槽/水龙头/柜体照明/开门器/升降机/衣帽间五金/辅料宣传
     - 功能五金 = 除基础五金(铰链/滑轨/反弹器)和辅料外的全部品类
     - 同比口径: 当年截至最大月份 vs 上年同期(截至同月); 上年全年单独统计
+    - 看板无密码门禁(全国通用版), 模板内 RAW 为占位符, 不含真实数据
 """
 import argparse
 import json
@@ -32,29 +38,40 @@ from collections import defaultdict
 
 import pandas as pd
 
-# ============================ 业务配置 ============================
-REMOVE_CUSTOMERS = {'山东鹏大新型材料科技有限公司', '德州科硕建材有限公司'}
-MERGE_CUSTOMERS = {'青岛博丽特五金有限公司': '青岛炬鑫五金有限公司'}
-# 16城市年度目标(万元)
-CITY_TARGET_WAN = {
-    '济南市': 600, '青岛市': 500, '淄博市': 180, '东营市': 100, '烟台市': 260,
-    '潍坊市': 100, '泰安市': 50, '临沂市': 450, '德州市': 450, '聊城市': 100,
-    '菏泽市': 100, '杭州市': 200, '宁波市': 100, '温州市': 200, '金华市': 180, '台州市': 350,
-}
-SALES_TARGET = {'卢力': 23000000, '刘滔': 10000000}
-KEEP_MIN_WAN = 5       # 客户排名: 当年销售额低于该值(万)的客户删除
-FILTER_MIN_WAN = 50    # 筛选器: 仅当年销售额≥该值(万)的客户进入
+# ============================ 业务配置(参数化) ============================
+REMOVE_CUSTOMERS = set()          # 剔除客户(由 --exclude-customers 传入)
+MERGE_CUSTOMERS = {}              # 客户合并(由 --merge-customers 传入)
+CITY_TARGET_WAN = {}              # 地级市年度目标(万), 由 --targets 加载
+PROVINCE_OWNER = {}               # 省份→业务员覆盖映射, 由 --province-owner 传入
+SALESMAN_COL = '销售员'           # 业务员字段列名
+KEEP_MIN_WAN = 5.0                # 客户排名: 当年销售额低于该值(万)的客户删除
+FILTER_MIN_WAN = 50.0             # 筛选器: 仅当年销售额≥该值(万)的客户进入
+TITLE = '炬森五金 · 销售数据看板'
+TOTAL_TARGET = 0                  # 年度总目标(元): 缺省=所有城市目标之和
 
 CATEGORY_ORDER = ['基础五金-铰链', '基础五金-滑轨', '基础五金-反弹器', '拉篮', '水槽',
                   '水龙头', '柜体照明', '开门器', '升降机', '衣帽间五金', '辅料宣传', '其他']
 
 
-def normalize_province(p):
-    return '山东省' if '山东' in str(p) else '浙江省'
+def norm_province(p):
+    """归一化省份名: 去空白、统一山东/浙江省写法。"""
+    if pd.isna(p):
+        return ''
+    s = str(p).strip()
+    if s in ('山东', '山东省'):
+        return '山东省'
+    if s in ('浙江', '浙江省'):
+        return '浙江省'
+    return s
 
 
-def salesperson_of(province):
-    return '卢力' if normalize_province(province) == '山东省' else '刘滔'
+def salesperson_of(province, salesman):
+    """业务员归属: --province-owner 配置优先覆盖, 否则用数据销售员字段。"""
+    p = norm_province(province)
+    if PROVINCE_OWNER and p in PROVINCE_OWNER:
+        return PROVINCE_OWNER[p]
+    s = str(salesman).strip() if not pd.isna(salesman) else ''
+    return s if s else ('未分配' if p else '未知')
 
 
 # ============================ 品类分类 ============================
@@ -171,26 +188,31 @@ def read_data(file26, file25=None):
 
 
 def clean_df(df, year_tag):
-    """清洗: 剔除客户、合并客户、业务员按省份覆盖。返回新DataFrame副本。"""
+    """清洗: 剔除客户、合并客户、业务员归属(销售员字段/省份覆盖)。返回新DataFrame副本。"""
     out = df.copy()
     out['__cust'] = out['客户名称'].apply(
         lambda c: None if (pd.isna(c) or c in REMOVE_CUSTOMERS) else MERGE_CUSTOMERS.get(c, c))
     out = out[out['__cust'].notna()]
-    out['__sp'] = out['省份'].apply(salesperson_of)
+    if SALESMAN_COL and SALESMAN_COL in out.columns:
+        out['__sp'] = out.apply(lambda r: salesperson_of(r['省份'], r[SALESMAN_COL]), axis=1)
+    else:
+        out['__sp'] = out['省份'].apply(lambda p: salesperson_of(p, ''))
+    out['__province'] = out['省份'].apply(norm_province)
+    out['__city'] = out['地级市'].apply(lambda c: str(c).strip() if not pd.isna(c) else '')
     out['__date'] = pd.to_datetime(out['发/退货日期'], errors='coerce')
     out['__month'] = out['__date'].dt.month
     return out
 
 
 # ============================ 汇总 ============================
-def build_raw(df26, df25, target, max_month_override=None, data_cutoff_override=None):
+def build_raw(df26, df25, max_month_override=None, data_cutoff_override=None):
     """由清洗后的当年/上年明细生成看板RAW JSON。"""
-    # ---- 当年(2026) ----
+    # ---- 当年 ----
     cur = clean_df(df26, '26')
     max_month = int(cur['__month'].max()) if max_month_override is None else max_month_override
     cutoff = pd.to_datetime(cur['__date'].max()).strftime('%Y-%m-%d') if data_cutoff_override is None else data_cutoff_override
 
-    # ---- 上年(2025): 同期(1..max_month) 与 全年 ----
+    # ---- 上年: 同期(1..max_month) 与 全年 ----
     prev_full = clean_df(df25, '25') if df25 is not None else None
     if prev_full is not None:
         prev_ytd = prev_full[prev_full['__month'] <= max_month]
@@ -213,10 +235,6 @@ def build_raw(df26, df25, target, max_month_override=None, data_cutoff_override=
     for df_ in (cur, prev_full, prev_ytd):
         if df_ is not None and '__cat' not in df_.columns:
             df_['__cat'] = df_.apply(lambda r: classify_category(r['大类名称'], r['小类名称']), axis=1)
-    if prev_full is not None and '__cat' not in prev_full.columns:
-        prev_full['__cat'] = prev_full.apply(lambda r: classify_category(r['大类名称'], r['小类名称']), axis=1)
-    if prev_ytd is not None and '__cat' not in prev_ytd.columns:
-        prev_ytd['__cat'] = prev_ytd.apply(lambda r: classify_category(r['大类名称'], r['小类名称']), axis=1)
 
     months = [str(m) for m in range(1, 13)]
 
@@ -236,7 +254,7 @@ def build_raw(df26, df25, target, max_month_override=None, data_cutoff_override=
         if df_ is None or len(df_) == 0:
             return {}
         s = df_.groupby('__cat')['含税本位币金额'].sum()
-        # 保留全部出现过的品类键(含金额为0的退货抵消情形), 与业务看板结构一致
+        # 保留全部出现过的品类键(含金额为0的退货抵消情形)
         return {k: float(v) for k, v in s.items()}
 
     global_category = {
@@ -245,49 +263,78 @@ def build_raw(df26, df25, target, max_month_override=None, data_cutoff_override=
         '2025_full': category_sum(prev_full),
     }
 
-    def total_of(d):
-        return float(sum(d.values()))
-
     totals = {
         '2026': float(cur['含税本位币金额'].sum()),
         '2025_ytd': float(prev_ytd['含税本位币金额'].sum()) if prev_ytd is not None and len(prev_ytd) else 0.0,
         '2025_full': float(prev_full['含税本位币金额'].sum()) if prev_full is not None and len(prev_full) else 0.0,
     }
 
-    # ---- 城市汇总 ----
+    # ---- 城市: 数据中出现的地级市 ∪ 目标配置城市 ----
+    city_sales26 = cur.groupby('__city')['含税本位币金额'].sum().sort_values(ascending=False)
+    city_order = list(city_sales26.index) + [c for c in CITY_TARGET_WAN if c not in city_sales26.index]
+    # 城市→省份: 数据推断(取该城市出现最多的省份), 无数据用配置
+    city_prov_from_data = cur.groupby('__city')['__province'].agg(lambda s: s.value_counts().idxmax() if len(s) else '')
+    city_prov_wan = {}
+    for c, v in CITY_TARGET_WAN.items():
+        if isinstance(v, dict):
+            city_prov_wan[c] = (v.get('province', ''), float(v.get('target_wan', 0)))
+        else:
+            city_prov_wan[c] = ('', float(v))
+
     city_summary = []
-    for city, wan in CITY_TARGET_WAN.items():
-        province = '山东省' if city in ('济南市', '青岛市', '淄博市', '东营市', '烟台市', '潍坊市',
-                                        '泰安市', '临沂市', '德州市', '聊城市', '菏泽市') else '浙江省'
-        tgt = wan * 10000
-        a26 = float(cur[cur['地级市'] == city]['含税本位币金额'].sum())
-        a25y = float(prev_ytd[prev_ytd['地级市'] == city]['含税本位币金额'].sum()) if prev_ytd is not None and len(prev_ytd) else 0.0
-        a25f = float(prev_full[prev_full['地级市'] == city]['含税本位币金额'].sum()) if prev_full is not None and len(prev_full) else 0.0
+    for city in city_order:
+        tgt_wan = city_prov_wan.get(city, ('', 0.0))[1] if city in city_prov_wan else 0.0
+        province = city_prov_wan.get(city, ('', 0.0))[0] if city in city_prov_wan else ''
+        if not province and city in city_prov_from_data.index:
+            province = str(city_prov_from_data.get(city, ''))
+        tgt = tgt_wan * 10000
+        a26 = float(city_sales26.get(city, 0.0))
+        a25y = float(prev_ytd[prev_ytd['__city'] == city]['含税本位币金额'].sum()) if prev_ytd is not None and len(prev_ytd) else 0.0
+        a25f = float(prev_full[prev_full['__city'] == city]['含税本位币金额'].sum()) if prev_full is not None and len(prev_full) else 0.0
         rate = a26 / tgt * 100 if tgt else 0.0
         yoy_inc = a26 - a25y
         yoy_rate = yoy_inc / a25y * 100 if a25y else 0.0
         city_summary.append({
-            'city': city, 'province': province, 'target': tgt, 'target_wan': wan,
+            'city': city, 'province': province, 'target': tgt, 'target_wan': tgt_wan,
             'actual_2026': round(a26, 2), 'actual_2025_ytd': round(a25y, 2), 'actual_2025_full': round(a25f, 2),
             'completion_rate': round(rate, 2), 'gap': round(tgt - a26, 2),
             'yoy_increment': round(yoy_inc, 2), 'yoy_rate': round(yoy_rate, 2),
         })
 
+    # ---- 业务员列表(含目标=其负责城市目标之和) ----
+    sp_provinces = cur.groupby('__sp')['__province'].agg(lambda s: sorted(set(x for x in s if x)))
+    sp_cities = cur.groupby('__sp')['__city'].agg(lambda s: set(x for x in s if x))
+    sp_sales26 = cur.groupby('__sp')['含税本位币金额'].sum()
+    salesmen = []
+    for sp in sp_sales26.sort_values(ascending=False).index:
+        tgt_wan = sum(city_prov_wan.get(c, ('', 0.0))[1] for c in sp_cities.get(sp, set()) if c in city_prov_wan)
+        salesmen.append({
+            'name': str(sp),
+            'provinces': sp_provinces.get(sp, []),
+            'cities': sorted(sp_cities.get(sp, set())),
+            'target': int(tgt_wan * 10000),
+            'target_wan': round(tgt_wan, 1),
+        })
+    total_target = TOTAL_TARGET or int(sum(city_prov_wan[c][1] for c in city_prov_wan) * 10000)
+
     # ---- 客户明细 ----
-    city_of = cur.drop_duplicates('__cust').set_index('__cust')['地级市'].to_dict()
+    cust_city = cur.drop_duplicates('__cust').set_index('__cust')['__city'].to_dict()
+    cust_prov = cur.drop_duplicates('__cust').set_index('__cust')['__province'].to_dict()
+    cust_sp = cur.drop_duplicates('__cust').set_index('__cust')['__sp'].to_dict()
     customers_out = []
     for i, c in enumerate(customers, 1):
         short = cur[cur['__cust'] == c]['客户简称']
         short = short.iloc[0] if len(short) and not pd.isna(short.iloc[0]) else c[:10]
-        city = city_of.get(c, '')
-        prov = '山东省' if normalize_province(cur[cur['__cust'] == c]['省份'].iloc[0]) == '山东省' else '浙江省'
+        city = cust_city.get(c, '')
+        prov = cust_prov.get(c, '')
+        sp = cust_sp.get(c, '')
         sub = cur[cur['__cust'] == c]
         sub25y = prev_ytd[prev_ytd['__cust'] == c] if prev_ytd is not None else None
         sub25f = prev_full[prev_full['__cust'] == c] if prev_full is not None else None
-        tgt_wan = CITY_TARGET_WAN.get(city, 0)
+        tgt_wan = city_prov_wan.get(city, ('', 0.0))[1] if city in city_prov_wan else 0.0
         customers_out.append({
             'name': c, 'short': str(short), 'province': prov, 'city': city,
-            'salesperson': salesperson_of(prov),
+            'salesperson': sp,
             'total_2026': round(float(sub['含税本位币金额'].sum()), 2),
             'total_2025_ytd': round(float(sub25y['含税本位币金额'].sum()), 2) if sub25y is not None else 0.0,
             'total_2025_full': round(float(sub25f['含税本位币金额'].sum()), 2) if sub25f is not None else 0.0,
@@ -406,10 +453,13 @@ def build_raw(df26, df25, target, max_month_override=None, data_cutoff_override=
         })
 
     raw = {
-        'target': int(target),
+        'title': TITLE,
+        'target': int(total_target),
+        'total_target': int(total_target),
+        'salesmen': salesmen,
         'max_month': int(max_month),
         'data_cutoff': cutoff,
-        'city_target': CITY_TARGET_WAN,
+        'city_target': {c: city_prov_wan[c][1] for c in city_prov_wan},
         'city_summary': city_summary,
         'customers': customers_out,
         'filter_customers': filter_customers,
@@ -434,6 +484,8 @@ def render_html(raw, template_path, out_path):
         raise RuntimeError('模板中未找到 __RAW_JSON__ 占位符')
     payload = json.dumps(raw, ensure_ascii=False)
     html = template.replace('__RAW_JSON__', payload, 1)
+    if '__TITLE__' in html:
+        html = html.replace('__TITLE__', raw.get('title', TITLE), 2)
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(html)
     return len(html)
@@ -449,6 +501,12 @@ def verify(raw):
     print(f"客户数: {len(raw['customers'])}  筛选器客户: {len(raw['filter_customers'])}")
     nc = sum(len(v) for v in raw['product_models'].values())
     print(f"产品型号数: {nc}  辅料明细: {len(raw['fuliao_detail'])}")
+    if raw['salesmen']:
+        print("业务员: " + ", ".join(f"{s['name']}(目标{s['target_wan']}万)" for s in raw['salesmen']))
+    else:
+        print("业务员: 无(检查销售员字段)")
+    if raw['city_summary']:
+        print(f"城市数: {len(raw['city_summary'])}  总目标: {raw['total_target']/10000:.0f}万")
     g = raw['global_category']['2026']
     for k in sorted(g, key=lambda x: -g[x]):
         print(f"  品类 {k}: {g[k]/10000:.2f}万")
@@ -457,15 +515,46 @@ def verify(raw):
     print(f"型号层当年合计: {s26/10000:.2f}万 (差异 {(s26-t['2026'])/10000:.2f}万)")
 
 
+def load_json_file(path, default, kind):
+    if not path:
+        return default
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception as e:
+        print(f'警告: 读取{kind}失败({path}): {e}')
+        return default
+
+
 def main():
-    ap = argparse.ArgumentParser(description='炬森五金鲁浙销售数据看板生成器')
+    ap = argparse.ArgumentParser(description='炬森五金销售数据看板生成器(全国通用版)')
     ap.add_argument('--file26', required=True, help='当年(2026)销售明细, 前4行筛选条件, 表头在第5行')
     ap.add_argument('--file25', help='上年(2025)销售明细, 表头在第1行, 含全年数据')
     ap.add_argument('--skip-25', action='store_true', help='跳过上年数据(不生成同比)')
     ap.add_argument('--out', default='sales_dashboard.html')
-    ap.add_argument('--target', type=int, default=31900000, help='年度总目标(元)')
+    ap.add_argument('--target', type=int, default=0, help='年度总目标(元), 缺省=所有城市目标之和')
+    ap.add_argument('--targets', default=None, help='地级市目标JSON文件(万): {"济南市":600} 或 {"济南市":{"province":"山东省","target_wan":600}}')
+    ap.add_argument('--salesman-col', default='销售员', help='业务员字段列名(缺省:销售员)')
+    ap.add_argument('--province-owner', default=None, help='省份→业务员覆盖JSON, 如 {"山东省":"卢力","浙江省":"刘滔"}')
+    ap.add_argument('--exclude-customers', default=None, help='剔除客户JSON数组, 如 ["客户A","客户B"]')
+    ap.add_argument('--merge-customers', default=None, help='客户合并JSON对象, 如 {"旧名":"新名"}')
+    ap.add_argument('--keep-min-wan', type=float, default=5.0, help='客户排名阈值(万), 缺省5')
+    ap.add_argument('--filter-min-wan', type=float, default=50.0, help='筛选器客户阈值(万), 缺省50')
+    ap.add_argument('--title', default='炬森五金 · 销售数据看板', help='看板标题')
     ap.add_argument('--template', default=None, help='HTML模板路径(默认脚本同目录template.html)')
     args = ap.parse_args()
+
+    global REMOVE_CUSTOMERS, MERGE_CUSTOMERS, CITY_TARGET_WAN, PROVINCE_OWNER, SALESMAN_COL
+    global KEEP_MIN_WAN, FILTER_MIN_WAN, TITLE, TOTAL_TARGET
+    REMOVE_CUSTOMERS = set(load_json_file(args.exclude_customers, [], '剔除客户') or [])
+    MERGE_CUSTOMERS = load_json_file(args.merge_customers, {}, '客户合并') or {}
+    CITY_TARGET_WAN = load_json_file(args.targets, {}, '目标配置') or {}
+    PROVINCE_OWNER = load_json_file(args.province_owner, {}, '省份业务员映射') or {}
+    SALESMAN_COL = args.salesman_col
+    KEEP_MIN_WAN = args.keep_min_wan
+    FILTER_MIN_WAN = args.filter_min_wan
+    TITLE = args.title
+    TOTAL_TARGET = args.target
 
     base = os.path.dirname(os.path.abspath(__file__))
     if args.template:
@@ -478,7 +567,7 @@ def main():
         sys.exit(f'模板不存在: {template}')
 
     df26, df25 = read_data(args.file26, args.file25 if not args.skip_25 else None)
-    raw = build_raw(df26, df25, args.target)
+    raw = build_raw(df26, df25)
     verify(raw)
     size = render_html(raw, template, args.out)
     print(f'看板已生成: {args.out} ({size/1024:.0f}KB)')
